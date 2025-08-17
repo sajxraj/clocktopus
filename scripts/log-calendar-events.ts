@@ -39,13 +39,23 @@ async function getLocalProjects(): Promise<Project[]> {
 program
   .option('-s, --start-date <startDate>', 'Start date for fetching calendar events')
   .option('-e, --end-date <endDate>', 'End date for fetching calendar events')
+  .option('-t, --today', 'Log time for today')
   .option('-p, --project-id <projectId>', 'Clockify project ID')
   .parse(process.argv);
 
-const { startDate, endDate, projectId } = program.opts();
+const opts = program.opts();
+
+const { projectId, today } = opts;
+let { startDate, endDate } = opts;
+
+if (today) {
+  const todayDate = new Date();
+  startDate = todayDate.toISOString().split('T')[0];
+  endDate = startDate;
+}
 
 if (!startDate || !endDate) {
-  console.error('Please provide both a start and end date.');
+  console.error('Please provide both a start and end date, or use the -t flag for today.');
   process.exit(1);
 }
 

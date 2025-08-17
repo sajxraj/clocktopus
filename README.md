@@ -204,6 +204,12 @@ yarn log-calendar -s <start-date> -e <end-date>
 - `<start-date>`: The start date for fetching calendar events (e.g., `2025-07-21`).
 - `<end-date>`: The end date for fetching calendar events (e.g., `2025-07-22`).
 
+You can also log events for today using the `-t` or `--today` flag:
+
+```bash
+yarn log-calendar -t
+```
+
 For each calendar event, the tool will prompt you to select a Clockify project. Your selection will be cached based on the event's summary (name), so if you have recurring events with the same name, you will only be asked once for the project. If you provide a `project-id` using the `-p` flag, all events will be logged to that project without prompting.
 
 Example:
