@@ -47,7 +47,7 @@ function getDb(): Database.Database {
     dbInstance.exec(`
       CREATE TABLE IF NOT EXISTS event_projects (
         eventName TEXT PRIMARY KEY,
-        projectId TEXT NOT NULL
+        projectId TEXT
       )
     `);
   }
@@ -55,14 +55,15 @@ function getDb(): Database.Database {
   return dbInstance;
 }
 
-export function getEventProject(eventName: string): string | null {
+export function getEventProject(eventName: string): string | null | undefined {
   const db = getDb();
   const stmt = db.prepare('SELECT projectId FROM event_projects WHERE eventName = ?');
-  const row = stmt.get(eventName) as { projectId: string } | undefined;
-  return row ? row.projectId : null;
+  const row = stmt.get(eventName) as { projectId: string | null } | undefined;
+
+  return row ? row.projectId : undefined;
 }
 
-export function setEventProject(eventName: string, projectId: string) {
+export function setEventProject(eventName: string, projectId: string | null) {
   const db = getDb();
   const stmt = db.prepare('INSERT OR REPLACE INTO event_projects (eventName, projectId) VALUES (?, ?)');
   stmt.run(eventName, projectId);

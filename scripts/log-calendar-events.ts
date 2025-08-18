@@ -1,6 +1,7 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
 
+import chalk from 'chalk';
 import { google } from 'googleapis';
 import { getAuthenticatedClient, getRefreshedToken } from '../lib/google.js';
 import { getEventProject, setEventProject, getLatestToken, storeToken } from '../lib/db.js';
@@ -124,27 +125,37 @@ async function main() {
         }
         if (event.summary && event.start && event.start.dateTime && event.end && event.end.dateTime) {
           let eventProjectId = projectId || getEventProject(event.summary);
+          if (eventProjectId === null) {
+            console.log(`Skipping "${event.summary}" as per your previous choice.`);
+            continue;
+          }
+
           if (!eventProjectId) {
             const { selectedProjectId } = await inquirer.prompt([
               {
                 type: 'list',
                 name: 'selectedProjectId',
                 message: `Which project for event "${event.summary}"?`,
-                choices: projects.map((p) => ({ name: p.name, value: p.id })),
+                choices: [
+                  { name: chalk.yellow('Skip'), value: null },
+                  ...projects.map((p) => ({ name: p.name, value: p.id })),
+                ],
               },
             ]);
             eventProjectId = selectedProjectId;
             setEventProject(event.summary, eventProjectId);
           }
 
-          console.log(`Logging "${event.summary}" to Clockify...`);
-          await clockify.logTime(
-            user.activeWorkspace,
-            eventProjectId,
-            event.start.dateTime,
-            event.end.dateTime,
-            event.summary,
-          );
+          if (eventProjectId) {
+            console.log(`Logging "${event.summary}" to Clockify...`);
+            await clockify.logTime(
+              user.activeWorkspace,
+              eventProjectId,
+              event.start.dateTime,
+              event.end.dateTime,
+              event.summary,
+            );
+          }
         }
       }
       console.log('Done!');
