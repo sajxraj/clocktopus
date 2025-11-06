@@ -10,6 +10,7 @@ import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { completeLatestSession, getLatestSession } from './lib/db.js';
 import { stopJiraTimer } from './lib/jira.js';
+import { spawn } from 'node:child_process';
 
 interface Project {
   id: string;
@@ -163,57 +164,99 @@ program
 
 program
   .command('monitor')
-  .description('Monitor system idle time and stop the Clockify timer if idle.')
+  .description('Monitor system idle time and screen state, and stop the Clockify timer if idle or screen is off.')
   .action(async () => {
     const { workspaceId, userId } = await getWorkspaceAndUser();
+
+    async function stopTimerAndLog(reason: string) {
+      const activeEntry = await clockify.getActiveTimer(workspaceId, userId);
+      if (activeEntry) {
+        console.log(chalk.yellow(reason));
+        const completedAt = new Date().toISOString();
+        const latestSession = getLatestSession();
+        const stoppedEntry = await clockify.stopTimer(workspaceId, userId);
+        if (stoppedEntry) {
+          completeLatestSession(completedAt, true);
+          if (latestSession.jiraTicket) {
+            const timeSpentSeconds = Math.round(
+              (new Date(completedAt).getTime() - new Date(latestSession.startedAt).getTime()) / 1000,
+            );
+            if (timeSpentSeconds >= 60) {
+              try {
+                await stopJiraTimer(latestSession.jiraTicket, timeSpentSeconds);
+              } catch (error) {
+                console.error('Error stopping Jira timer:', error);
+              }
+            }
+          }
+          console.log(chalk.red('Timer stopped.'));
+          return true; // indicates timer was stopped
+        }
+      }
+      return false; // indicates timer was not running or failed to stop
+    }
+
+    async function restartTimerIfNeeded() {
+      const latestSession = getLatestSession();
+      if (latestSession && latestSession.isAutoCompleted && latestSession.completedAt) {
+        const activeEntry = await clockify.getActiveTimer(workspaceId, userId);
+        if (!activeEntry) {
+          await clockify.startTimer(workspaceId, latestSession.projectId, latestSession.description);
+          console.log(chalk.green('Timer restarted for the last used project.'));
+        }
+      }
+    }
+
+    console.log(chalk.blue('Monitoring system idle time and screen state...'));
+
+    // Screen state monitoring
+    const monitorProcess = spawn('log', [
+      'stream',
+      '--style',
+      'syslog',
+      '--predicate',
+      'eventMessage CONTAINS "Display sleep" OR eventMessage CONTAINS "Screen off" OR eventMessage CONTAINS "Display wake" OR eventMessage CONTAINS "Screen on"',
+    ]);
+
+    let wasStoppedByScreenOff = false;
+
+    // eslint-disable-next-line
+    monitorProcess.stdout.on('data', async (data: any) => {
+      const output = data.toString();
+      if (output.includes('Display sleep') || output.includes('Screen off')) {
+        const stopped = await stopTimerAndLog('Screen is off. Stopping timer...');
+        if (stopped) {
+          wasStoppedByScreenOff = true;
+        }
+      } else if (output.includes('Display wake') || output.includes('Screen on')) {
+        if (wasStoppedByScreenOff) {
+          console.log(chalk.green('Screen is back on. Restarting timer...'));
+          await restartTimerIfNeeded();
+          wasStoppedByScreenOff = false;
+        }
+      }
+    });
+
+    monitorProcess.stderr.on('data', (data: unknown) => {
+      console.error(`log stderr: ${data}`);
+    });
+
+    // Idle time monitoring
     const IDLE_THRESHOLD_SECONDS = 300; // 5 minutes
-
-    console.log(chalk.blue('Monitoring system idle time...'));
-
     let lastIdle = false;
-
     setInterval(async () => {
       const idleModule = await import('desktop-idle');
       const idleTime = idleModule.default.getIdleTime();
 
       if (idleTime >= IDLE_THRESHOLD_SECONDS) {
-        lastIdle = true;
-        const activeEntry = await clockify.getActiveTimer(workspaceId, userId);
-        if (activeEntry) {
-          const completedAt = new Date().toISOString();
-          console.log(chalk.yellow(`System idle for ${Math.floor(idleTime)} seconds. Stopping timer...`));
-
-          const latestSession = getLatestSession();
-          const stoppedEntry = await clockify.stopTimer(workspaceId, userId);
-          if (stoppedEntry) {
-            completeLatestSession(completedAt, true);
-            if (latestSession.jiraTicket) {
-              const timeSpentSeconds = Math.round(
-                (new Date(completedAt).getTime() - new Date(latestSession.startedAt).getTime()) / 1000,
-              );
-              if (timeSpentSeconds >= 60) {
-                try {
-                  await stopJiraTimer(latestSession.jiraTicket, timeSpentSeconds);
-                } catch (error) {
-                  console.error('Error stopping Jira timer:', error);
-                }
-              }
-            }
-            console.log(chalk.red('Timer stopped due to idle activity.'));
-          }
+        const stopped = await stopTimerAndLog(`System idle for ${Math.floor(idleTime)} seconds. Stopping timer...`);
+        if (stopped) {
+          lastIdle = true;
         }
       } else {
         // User is active
         if (lastIdle) {
-          // Check if the latest session was autoCompleted, if yes, start new timer
-          const latestSession = getLatestSession();
-          if (latestSession && latestSession.isAutoCompleted && latestSession.completedAt) {
-            const activeEntry = await clockify.getActiveTimer(workspaceId, userId);
-            if (!activeEntry) {
-              await clockify.startTimer(workspaceId, latestSession.projectId, latestSession.description);
-              console.log(chalk.green('User is active again. Timer restarted for the last used project.'));
-            }
-          }
+          await restartTimerIfNeeded();
         }
         lastIdle = false;
       }
