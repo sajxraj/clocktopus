@@ -10,7 +10,6 @@ import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { completeLatestSession, getLatestSession } from './lib/db.js';
 import { stopJiraTimer } from './lib/jira.js';
-import { spawn } from 'node:child_process';
 
 interface Project {
   id: string;
@@ -162,6 +161,15 @@ program
     }
   });
 
+function lineMatches(haystack: string, needles: (string | RegExp)[]) {
+  const s = haystack.toLowerCase();
+  return needles.some((n) => (typeof n === 'string' ? s.includes(n.toLowerCase()) : n.test(haystack)));
+}
+
+function sleep(ms: number) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
 program
   .command('monitor')
   .description('Monitor system idle time and screen state, and stop the Clockify timer if idle or screen is off.')
@@ -170,97 +178,179 @@ program
 
     async function stopTimerAndLog(reason: string) {
       const activeEntry = await clockify.getActiveTimer(workspaceId, userId);
-      if (activeEntry) {
-        console.log(chalk.yellow(reason));
-        const completedAt = new Date().toISOString();
-        const latestSession = getLatestSession();
-        const stoppedEntry = await clockify.stopTimer(workspaceId, userId);
-        if (stoppedEntry) {
-          completeLatestSession(completedAt, true);
-          if (latestSession.jiraTicket) {
-            const timeSpentSeconds = Math.round(
-              (new Date(completedAt).getTime() - new Date(latestSession.startedAt).getTime()) / 1000,
-            );
-            if (timeSpentSeconds >= 60) {
-              try {
-                await stopJiraTimer(latestSession.jiraTicket, timeSpentSeconds);
-              } catch (error) {
-                console.error('Error stopping Jira timer:', error);
-              }
-            }
-          }
-          console.log(chalk.red('Timer stopped.'));
-          return true; // indicates timer was stopped
-        }
-      }
-      return false; // indicates timer was not running or failed to stop
-    }
+      if (!activeEntry) return false;
 
-    async function restartTimerIfNeeded() {
+      console.log(chalk.yellow(reason));
+      const completedAt = new Date().toISOString();
       const latestSession = getLatestSession();
-      if (latestSession && latestSession.isAutoCompleted && latestSession.completedAt) {
-        const activeEntry = await clockify.getActiveTimer(workspaceId, userId);
-        if (!activeEntry) {
-          await clockify.startTimer(workspaceId, latestSession.projectId, latestSession.description);
-          console.log(chalk.green('Timer restarted for the last used project.'));
+
+      const stoppedEntry = await clockify.stopTimer(workspaceId, userId);
+      if (!stoppedEntry) return false;
+
+      completeLatestSession(completedAt, true);
+
+      if (latestSession?.jiraTicket) {
+        const timeSpentSeconds = Math.round(
+          (new Date(completedAt).getTime() - new Date(latestSession.startedAt).getTime()) / 1000,
+        );
+        if (timeSpentSeconds >= 60) {
+          try {
+            await stopJiraTimer(latestSession.jiraTicket, timeSpentSeconds);
+          } catch (err) {
+            console.error('Error stopping Jira timer:', err);
+          }
         }
       }
+
+      console.log(chalk.red('Timer stopped.'));
+      return true;
     }
 
-    console.log(chalk.blue('Monitoring system idle time and screen state...'));
+    // Safer restart w/ cooldown; only resume a recent auto-completed session
+    let lastResumeAt = 0;
+    const RESUME_COOLDOWN_MS = 10_000;
 
-    // Screen state monitoring
-    const monitorProcess = spawn('log', [
-      'stream',
-      '--style',
-      'syslog',
-      '--predicate',
-      'eventMessage CONTAINS "Display sleep" OR eventMessage CONTAINS "Screen off" OR eventMessage CONTAINS "Display wake" OR eventMessage CONTAINS "Screen on"',
-    ]);
+    async function safeRestartTimerIfNeeded() {
+      const now = Date.now();
+      if (now - lastResumeAt < RESUME_COOLDOWN_MS) return;
 
+      // Small delay lets services settle after wake/activity
+      await sleep(800);
+
+      const latestSession = getLatestSession();
+      if (!latestSession) return;
+
+      const activeEntry = await clockify.getActiveTimer(workspaceId, userId);
+      if (activeEntry) return;
+
+      const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+      const completedAt = latestSession.completedAt ? new Date(latestSession.completedAt).getTime() : 0;
+
+      const eligible = latestSession.isAutoCompleted && completedAt > twoHoursAgo && !!latestSession.projectId;
+
+      if (!eligible) return;
+
+      await clockify.startTimer(workspaceId, latestSession.projectId, latestSession.description);
+      console.log(chalk.green('Timer restarted for the last used project.'));
+      lastResumeAt = Date.now();
+    }
+
+    console.log(chalk.blue('Monitoring display events (Unified Log) and idle time...'));
+
+    // ---------- DISPLAY EVENTS (Unified Log) ----------
+    // Very broad predicate; we don’t restrict to a single process because
+    // strings can come from different components on different macOS versions.
+    const predicate = `
+        (subsystem == "com.apple.powermanagement" OR
+         category CONTAINS[c] "Display" OR
+         eventMessage CONTAINS[c] "Display" OR
+         eventMessage CONTAINS[c] "Screen" OR
+         eventMessage CONTAINS[c] "DarkWake" OR
+         eventMessage CONTAINS[c] "Wake from Sleep" OR
+         eventMessage CONTAINS[c] "wake reason")
+      `.replace(/\s+/g, ' ');
+
+    const logProc = spawn('log', ['stream', '--style', 'syslog', '--info', '--debug', '--predicate', predicate]);
+
+    let buffer = '';
     let wasStoppedByScreenOff = false;
 
-    // eslint-disable-next-line
-    monitorProcess.stdout.on('data', async (data: any) => {
-      const output = data.toString();
-      if (output.includes('Display sleep') || output.includes('Screen off')) {
-        const stopped = await stopTimerAndLog('Screen is off. Stopping timer...');
-        if (stopped) {
-          wasStoppedByScreenOff = true;
-        }
-      } else if (output.includes('Display wake') || output.includes('Screen on')) {
-        if (wasStoppedByScreenOff) {
-          console.log(chalk.green('Screen is back on. Restarting timer...'));
-          await restartTimerIfNeeded();
-          wasStoppedByScreenOff = false;
+    const DEBUG_LOG_LINES = false;
+
+    logProc.stdout.setEncoding('utf8');
+    logProc.stdout.on('data', async (chunk: string) => {
+      buffer += chunk;
+      let idx: number;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+
+        if (DEBUG_LOG_LINES) console.log(chalk.gray('[oslog]'), line);
+
+        // Try to capture the common variants across macOS versions
+        const isOff = lineMatches(line, [
+          'display is turned off',
+          'display sleep',
+          'screen off',
+          /dpms.*off/i,
+          /display:\s*off/i,
+        ]);
+
+        const isOn = lineMatches(line, [
+          'display is turned on',
+          'display wake',
+          'wake from sleep',
+          'darkwake',
+          'screen on',
+          /dpms.*on/i,
+          /display:\s*on/i,
+        ]);
+
+        if (isOff) {
+          const stopped = await stopTimerAndLog('Screen is off. Stopping timer...');
+          if (stopped) wasStoppedByScreenOff = true;
+        } else if (isOn) {
+          if (wasStoppedByScreenOff) {
+            console.log(chalk.green('Screen is back on. Attempting to restart timer...'));
+            await safeRestartTimerIfNeeded();
+            wasStoppedByScreenOff = false;
+          } else {
+            // Fallback: if we missed the "off" event, still try a resume
+            await safeRestartTimerIfNeeded();
+          }
         }
       }
     });
 
-    monitorProcess.stderr.on('data', (data: unknown) => {
-      console.error(`log stderr: ${data}`);
+    logProc.stderr.on('data', (d: unknown) => {
+      console.error(`log stderr: ${d}`);
     });
 
-    // Idle time monitoring
+    logProc.on('close', (code: number) => {
+      console.log(chalk.gray(`log stream exited with code ${code}`));
+    });
+
+    // ---------- IDLE MONITOR ----------
     const IDLE_THRESHOLD_SECONDS = 300; // 5 minutes
     let lastIdle = false;
-    setInterval(async () => {
-      const idleModule = await import('desktop-idle');
-      const idleTime = idleModule.default.getIdleTime();
 
-      if (idleTime >= IDLE_THRESHOLD_SECONDS) {
-        const stopped = await stopTimerAndLog(`System idle for ${Math.floor(idleTime)} seconds. Stopping timer...`);
-        if (stopped) {
-          lastIdle = true;
+    const idleInterval = setInterval(async () => {
+      try {
+        const idleModule = await import('desktop-idle');
+        const idleTime = idleModule.default.getIdleTime();
+
+        if (idleTime >= IDLE_THRESHOLD_SECONDS) {
+          const stopped = await stopTimerAndLog(`System idle for ${Math.floor(idleTime)} seconds. Stopping timer...`);
+          if (stopped) lastIdle = true;
+        } else {
+          // User active again → resume even if display log events were missed
+          if (lastIdle) {
+            await safeRestartTimerIfNeeded();
+          }
+          lastIdle = false;
         }
-      } else {
-        // User is active
-        if (lastIdle) {
-          await restartTimerIfNeeded();
-        }
-        lastIdle = false;
+      } catch (e) {
+        // swallow; desktop-idle can occasionally throw on wake races
       }
-    }, 5000); // Check every 5 seconds
+    }, 5000);
+
+    // ---------- CLEANUP ----------
+    function cleanupAndExit(code = 0) {
+      try {
+        clearInterval(idleInterval);
+      } catch {}
+      try {
+        if (logProc && !logProc.killed) logProc.kill('SIGTERM');
+      } catch {}
+      process.exit(code);
+    }
+
+    process.on('SIGINT', () => {
+      console.log(chalk.gray('\nStopping monitor...'));
+      cleanupAndExit(0);
+    });
+
+    process.on('SIGTERM', () => cleanupAndExit(0));
   });
 
 program.parse(process.argv);
