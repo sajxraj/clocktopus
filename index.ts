@@ -238,30 +238,34 @@ program
     console.log(chalk.blue('Monitoring display/lock state (macos-notification-state) and idle time...'));
 
     try {
-      const nsModule = await import('macos-notification-state');
-      const getSessionState = nsModule.default?.getSessionState || nsModule.getSessionState;
+      if (process.platform === 'darwin') {
+        const nsModule = await import('macos-notification-state');
+        const getSessionState = nsModule.default?.getSessionState || nsModule.getSessionState;
 
-      if (!getSessionState) {
-        throw new Error('getSessionState not found in module');
-      }
-
-      pollInterval = setInterval(async () => {
-        try {
-          const state = getSessionState();
-          const locked = state === 'SESSION_SCREEN_IS_LOCKED';
-
-          if (locked && !isLocked) {
-            isLocked = true;
-            await stopTimerAndLog('Screen is locked/off. Stopping timer...');
-          } else if (!locked && isLocked) {
-            console.log(chalk.green('Screen is unlocked/on. Attempting to restart timer...'));
-            await safeRestartTimerIfNeeded();
-            isLocked = false;
-          }
-        } catch (error) {
-          console.error('Error polling session state:', error);
+        if (!getSessionState) {
+          throw new Error('getSessionState not found in module');
         }
-      }, 3000);
+
+        pollInterval = setInterval(async () => {
+          try {
+            const state = getSessionState();
+            const locked = state === 'SESSION_SCREEN_IS_LOCKED';
+
+            if (locked && !isLocked) {
+              isLocked = true;
+              await stopTimerAndLog('Screen is locked/off. Stopping timer...');
+            } else if (!locked && isLocked) {
+              console.log(chalk.green('Screen is unlocked/on. Attempting to restart timer...'));
+              await safeRestartTimerIfNeeded();
+              isLocked = false;
+            }
+          } catch (error) {
+            console.error('Error polling session state:', error);
+          }
+        }, 3000);
+      } else {
+        console.log(chalk.yellow('Display monitoring (lock state) is only supported on macOS. Skipping.'));
+      }
     } catch (err) {
       console.error(chalk.red('Failed to load macos-notification-state. Display monitoring will be disabled.'));
       console.error(err);
